@@ -1,0 +1,16 @@
+services:
+  claude-max-api-proxy:
+    image: ghcr.io/freichelt/claude-max-api-proxy:latest
+    build: .
+    ports:
+      - "${PORT:-3456}:3456"
+    volumes:
+      # Mount host Claude credentials so the CLI is authenticated inside the container.
+      # Run `claude auth login` on the host once; the container picks it up automatically.
+      - ~/.claude:/root/.claude:ro
+    environment:
+      - PORT=3456
+      # Override the claude binary path if needed, e.g. if you install a custom build
+      # - CLAUDE_BIN=/usr/local/bin/claude
+      - DEBUG_SUBPROCESS=${DEBUG_SUBPROCESS:-}
+    restart: unless-stopped
