@@ -7,7 +7,7 @@
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
-import { openaiToCli } from "../adapter/openai-to-cli.js";
+import { openaiToCli, messagesToPrompt, extractModel } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
@@ -375,6 +375,171 @@ async function handleNonStreamingResponse(
         });
         resolve();
       });
+  });
+}
+
+/**
+ * Handle POST /v1/responses  (OpenAI Responses API — minimal, structured-output focused)
+ *
+ * Clients like graphiti_core call `client.responses.parse(model, input,
+ * max_output_tokens, text_format=<schema>)` and read `response.output_text`
+ * (json.loads) plus `response.usage`. The Claude CLI has no Responses API, so we
+ * flatten the request into a single prompt (injecting the requested JSON Schema as
+ * an instruction), run the CLI, and return a Responses-shaped object whose
+ * `output_text` is the cleaned JSON. Non-streaming only (what parse() uses).
+ */
+interface ResponsesInputItem {
+  role: string;
+  content: string | Array<{ type: string; text?: string }>;
+}
+interface OpenAIResponsesRequest {
+  model: string;
+  input: string | ResponsesInputItem[];
+  instructions?: string;
+  max_output_tokens?: number;
+  temperature?: number;
+  text?: { format?: Record<string, unknown> };
+  response_format?: Record<string, unknown>;
+  stream?: boolean;
+}
+
+function buildResponsesPrompt(body: OpenAIResponsesRequest): { prompt: string; model: ReturnType<typeof extractModel> } {
+  const messages: OpenAIChatRequest["messages"] = [];
+  if (body.instructions) messages.push({ role: "system", content: body.instructions });
+  if (typeof body.input === "string") {
+    messages.push({ role: "user", content: body.input });
+  } else if (Array.isArray(body.input)) {
+    for (const it of body.input) {
+      // Responses content blocks use {type:"input_text"|"output_text", text}; the
+      // openai-to-cli extractor already understands input_text/text.
+      messages.push({ role: it.role as "system" | "user" | "assistant", content: it.content as never });
+    }
+  }
+  let prompt = messagesToPrompt(messages);
+
+  // The OpenAI SDK serialises text_format=<pydantic> into text.format =
+  // { type:"json_schema", name, strict:true, schema:{...} }.
+  const fmt = (body.text?.format ?? body.response_format) as
+    | { type?: string; schema?: unknown; json_schema?: { schema?: unknown } }
+    | undefined;
+  const schema = fmt?.schema ?? fmt?.json_schema?.schema;
+  if (schema) {
+    prompt +=
+      "\n\n<output_format>\nRespond with ONLY a single JSON value that strictly conforms to this JSON Schema. " +
+      "Output raw JSON — no prose, no explanation, no markdown code fences.\nJSON Schema:\n" +
+      JSON.stringify(schema) +
+      "\n</output_format>";
+  } else if (fmt?.type === "json_object") {
+    prompt += "\n\n<output_format>\nRespond with ONLY a valid JSON object. No prose, no markdown fences.\n</output_format>";
+  }
+  return { prompt, model: extractModel(body.model) };
+}
+
+/** Best-effort: pull a clean JSON string out of the model's text output. */
+function extractJsonText(text: string): string {
+  let t = text.trim();
+  const fence = t.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fence) t = fence[1].trim();
+  if (!(t.startsWith("{") || t.startsWith("["))) {
+    const firstObj = t.indexOf("{");
+    const firstArr = t.indexOf("[");
+    const candidates = [firstObj, firstArr].filter((i) => i !== -1);
+    const start = candidates.length ? Math.min(...candidates) : -1;
+    const end = Math.max(t.lastIndexOf("}"), t.lastIndexOf("]"));
+    if (start !== -1 && end > start) t = t.slice(start, end + 1);
+  }
+  return t;
+}
+
+export async function handleResponses(req: Request, res: Response): Promise<void> {
+  const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
+  const body = req.body as OpenAIResponsesRequest;
+
+  if (!body || body.input === undefined || body.input === null) {
+    res.status(400).json({
+      error: { message: "input is required", type: "invalid_request_error", code: "invalid_input" },
+    });
+    return;
+  }
+
+  const wantsJson = !!(body.text?.format || body.response_format);
+  const { prompt, model } = buildResponsesPrompt(body);
+  const subprocess = new ClaudeSubprocess();
+
+  await new Promise<void>((resolve) => {
+    let finalResult: ClaudeCliResult | null = null;
+
+    subprocess.on("result", (r: ClaudeCliResult) => {
+      finalResult = r;
+    });
+
+    subprocess.on("error", (error: Error) => {
+      console.error("[handleResponses] Error:", error.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
+      }
+      resolve();
+    });
+
+    subprocess.on("close", (code: number | null) => {
+      if (res.headersSent) {
+        resolve();
+        return;
+      }
+      if (!finalResult) {
+        res.status(500).json({
+          error: {
+            message: `Claude CLI exited with code ${code} without response`,
+            type: "server_error",
+            code: null,
+          },
+        });
+        resolve();
+        return;
+      }
+      const raw = String(finalResult.result ?? "");
+      const outText = wantsJson ? extractJsonText(raw) : raw;
+      const usage = finalResult.usage;
+      const inTok = usage?.input_tokens || 0;
+      const outTok = usage?.output_tokens || 0;
+
+      res.json({
+        id: `resp_${requestId}`,
+        object: "response",
+        created_at: Math.floor(Date.now() / 1000),
+        status: "completed",
+        error: null,
+        incomplete_details: null,
+        instructions: body.instructions ?? null,
+        max_output_tokens: body.max_output_tokens ?? null,
+        model: body.model,
+        output: [
+          {
+            type: "message",
+            id: `msg_${requestId}`,
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text: outText, annotations: [] }],
+          },
+        ],
+        output_text: outText,
+        parallel_tool_calls: false,
+        temperature: body.temperature ?? null,
+        tool_choice: "auto",
+        tools: [],
+        top_p: null,
+        usage: { input_tokens: inTok, output_tokens: outTok, total_tokens: inTok + outTok },
+        metadata: {},
+      });
+      resolve();
+    });
+
+    subprocess.start(prompt, { model }).catch((error: Error) => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
+      }
+      resolve();
+    });
   });
 }
 
