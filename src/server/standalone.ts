@@ -43,9 +43,10 @@ async function main(): Promise<void> {
   }
   console.log("  Authentication: OK\n");
 
-  // Start server
+  // Start server — bind to 0.0.0.0 in containers, 127.0.0.1 by default locally
+  const host = process.env.HOST ?? "127.0.0.1";
   try {
-    await startServer({ port });
+    await startServer({ port, host });
     console.log("\nServer ready. Test with:");
     console.log(`  curl -X POST http://localhost:${port}/v1/chat/completions \\`);
     console.log(`    -H "Content-Type: application/json" \\`);
